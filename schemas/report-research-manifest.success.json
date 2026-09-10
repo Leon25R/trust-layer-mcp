@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/report-research-manifest.success.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["ok", "code", "manifest_receipt_id", "batch_status", "rate_charge", "remaining_24h"],
+  "properties": { "ok": { "const": true }, "code": { "enum": ["accepted", "accepted_idempotent"] }, "manifest_receipt_id": { "type": "string", "pattern": "^m_[A-Za-z0-9_-]{16,64}$" }, "batch_status": { "enum": ["awaiting_batches", "complete_eligible"] }, "rate_charge": { "enum": ["none", "new_final_assessment"] }, "remaining_24h": { "type": "integer", "minimum": 0, "maximum": 50 } }
+}

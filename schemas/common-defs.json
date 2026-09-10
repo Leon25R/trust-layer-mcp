@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/common-defs.json",
+  "$defs": {
+    "research_id_v4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "domain": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+      "maxLength": 253
+    },
+    "agent_model_name": {
+      "enum": ["openai_gpt5", "anthropic_claude4", "google_gemini3", "local_fixed", "other_fixed", "unknown"]
+    },
+    "outcome": {
+      "enum": ["used_as_support", "rejected_or_conflicted", "insufficient_evidence"]
+    },
+    "assessment_reason_code": {
+      "enum": ["direct_evidence", "primary_source_conflict", "stale_or_changed", "citation_missing", "unclear"]
+    },
+    "guidance_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "source_ref": { "type": "string", "pattern": "^s[1-9][0-9]{0,3}$" }
+  }
+}

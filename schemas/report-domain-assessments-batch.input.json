@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.input.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["assessments"],
+  "properties": {
+    "assessments": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items": true
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/report-domain-assessment.input.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["research_id", "collection_mode", "rubric_version", "domain", "outcome", "reason_code", "agent_model_name"],
+  "properties": {
+    "research_id": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/research_id_v4" },
+    "collection_mode": { "const": "minimal_observation" },
+    "rubric_version": { "const": "0.3" },
+    "guidance_version": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/guidance_version" },
+    "domain": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/domain" },
+    "outcome": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/outcome" },
+    "reason_code": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/assessment_reason_code" },
+    "agent_model_name": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/agent_model_name" }
+  }
+}

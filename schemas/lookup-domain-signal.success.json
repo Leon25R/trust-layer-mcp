@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/lookup-domain-signal.success.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["ok", "domain", "state", "state_reason", "aggregate_window", "last_observed_at", "last_evaluated_at", "decisive_observation_band", "mixedness", "evidence_coverage", "verification_coverage", "model_diversity", "cautions"],
+  "properties": {
+    "ok": { "const": true },
+    "domain": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/domain" },
+    "state": { "enum": ["insufficient", "consistent_support", "mixed_observations", "review_hold", "withdrawn"] },
+    "state_reason": { "enum": ["insufficient_volume", "insufficient_groups", "model_diversity_unconfirmed", "insufficient_support_strength", "support_conditions_met", "material_conflict", "rejection_dominant", "balanced", "fragile_to_group_removal", "counterevidence_confirmed_domain_wide", "active_objection", "integrity_anomaly", "high_risk_audit_pending", "stage1_positive_state_disabled", "withdrawn_by_correction", "withdrawn_after_receipt_expiry"] },
+    "aggregate_window": { "type": "object", "additionalProperties": false, "required": ["kind", "days", "window_start"], "properties": { "kind": { "const": "rolling" }, "days": { "const": 90 }, "window_start": { "type": "string", "format": "date-time" } } },
+    "last_observed_at": { "type": ["string", "null"], "format": "date-time" },
+    "last_evaluated_at": { "type": "string", "format": "date-time" },
+    "decisive_observation_band": { "enum": ["0", "1-2", "3-7", "8-9", "10+"] },
+    "mixedness": { "enum": ["not_computable", "none", "low", "material", "balanced"] },
+    "evidence_coverage": { "enum": ["none", "minimal_only", "partial_manifest", "manifest_only"] },
+    "verification_coverage": { "enum": ["not_sampled", "inconclusive_only", "source_hygiene_spot_checked", "audit_hold"] },
+    "model_diversity": { "enum": ["not_applicable", "unconfirmed", "met"] },
+    "cautions": { "type": "array", "maxItems": 5, "uniqueItems": true, "items": { "enum": ["not_truth_claim", "additional_primary_check_recommended", "model_diversity_unconfirmed", "review_hold_do_not_rely", "withdrawn_do_not_rely", "source_hygiene_only"] } }
+  }
+}

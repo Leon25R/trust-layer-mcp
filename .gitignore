@@ -1,0 +1,11 @@
+# Build artifacts and installed dependencies are not source artifacts.
+dist/
+node_modules/
+
+# Environment files may contain deployment secrets.
+.env
+*.env
+
+# The original workspace excluded HTML files; the public entrypoint is source.
+*.html
+!public/index.html

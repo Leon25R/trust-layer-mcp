@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/lookup-domain-signal.input.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["domain"],
+  "properties": { "domain": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/domain" } }
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/common-error.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["ok", "code", "request_digest"],
+  "properties": {
+    "ok": { "const": false },
+    "code": { "enum": ["invalid_schema", "invalid_enum", "invalid_reference", "invalid_url", "forbidden_url_scope", "batch_incomplete", "batch_expired", "research_id_conflict", "token_invalid", "origin_not_allowed", "rate_limited", "not_found", "not_authorized", "internal_error"] },
+    "retry_after_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+    "retry_directive": { "enum": ["fix_request_then_retry_after_delay"] },
+    "request_digest": { "type": "string", "pattern": "^d_[A-Za-z0-9_-]{16,64}$" }
+  },
+  "oneOf": [
+    {
+      "properties": { "code": { "const": "rate_limited" } },
+      "required": ["retry_after_seconds"],
+      "not": { "required": ["retry_directive"] }
+    },
+    {
+      "properties": { "code": { "const": "invalid_schema" } },
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              { "required": ["retry_after_seconds"] },
+              { "required": ["retry_directive"] }
+            ]
+          }
+        },
+        {
+          "required": ["retry_after_seconds", "retry_directive"],
+          "properties": {
+            "retry_directive": { "const": "fix_request_then_retry_after_delay" }
+          }
+        }
+      ]
+    },
+    {
+      "properties": {
+        "code": { "not": { "enum": ["rate_limited", "invalid_schema"] } }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["retry_after_seconds"] },
+          { "required": ["retry_directive"] }
+        ]
+      }
+    }
+  ]
+}

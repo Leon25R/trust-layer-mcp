@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/public-domain-signal-v1.success.json",
+  "title": "Public domain signal v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "domain", "publication_status", "signal", "source_routes", "next_checks", "limitations"],
+  "properties": {
+    "schema_version": { "const": "public-domain-signal-v1" },
+    "domain": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$", "maxLength": 253 },
+    "publication_status": { "enum": ["no_public_observations", "limited_observations", "under_review", "withdrawn"] },
+    "signal": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reason_code", "scope", "checked_on"],
+          "properties": {
+            "kind": { "const": "operator_observation" },
+            "reason_code": { "const": "fixed_public_notice" },
+            "scope": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "checked_on": { "type": "string", "format": "date" }
+          }
+        }
+      ]
+    },
+    "source_routes": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["domain", "official_source_url", "update_history_url", "checked_on", "scope"],
+        "properties": {
+          "domain": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$", "maxLength": 253 },
+          "official_source_url": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2048 },
+          "update_history_url": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2048 },
+          "checked_on": { "type": "string", "format": "date" },
+          "scope": { "type": "string", "minLength": 1, "maxLength": 500 }
+        }
+      }
+    },
+    "next_checks": {
+      "type": "array",
+      "const": ["identify_publisher", "check_date", "check_primary_evidence"]
+    },
+    "limitations": {
+      "type": "array",
+      "const": ["not_a_truth_rating"]
+    }
+  }
+}

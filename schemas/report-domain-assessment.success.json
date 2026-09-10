@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/report-domain-assessment.success.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["ok", "code", "receipt_id", "remaining_24h", "aggregate_effect"],
+  "properties": { "ok": { "const": true }, "code": { "enum": ["accepted", "accepted_idempotent"] }, "receipt_id": { "type": "string", "pattern": "^r_[A-Za-z0-9_-]{16,64}$" }, "remaining_24h": { "type": "integer", "minimum": 0, "maximum": 50 }, "aggregate_effect": { "enum": ["eligible", "deduplicated", "pending_weight"] } }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/manifest-source-entry-v0.3.json",
+  "oneOf": [
+    {
+      "title": "canonical_url",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_ref", "url_scope", "canonical_url", "domain", "source_disposition", "reason_codes", "related_source_refs", "source_type", "published_date_precision"],
+      "properties": {
+        "source_ref": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/source_ref" },
+        "url_scope": { "const": "canonical_url" },
+        "canonical_url": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2048 },
+        "domain": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/domain" },
+        "source_disposition": { "enum": ["used_as_support", "rejected_or_conflicted", "considered_not_relied", "unreadable"] },
+        "reason_codes": { "type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true, "items": { "enum": ["primary_source", "directly_addresses_scope", "cross_verified", "contradicted_by_primary", "stale_or_changed", "citation_missing", "unreadable_or_paywalled", "irrelevant_to_scope", "unclear"] } },
+        "related_source_refs": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/source_ref" } },
+        "source_type": { "enum": ["primary", "regulator", "publisher", "community", "unknown"] },
+        "published_date_precision": { "enum": ["day", "month", "year", "unknown"] }
+      }
+    },
+    {
+      "title": "domain_only",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_ref", "url_scope", "domain", "source_disposition", "reason_codes", "related_source_refs", "source_type", "published_date_precision"],
+      "properties": {
+        "source_ref": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/source_ref" },
+        "url_scope": { "const": "domain_only" },
+        "domain": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/domain" },
+        "source_disposition": { "enum": ["used_as_support", "rejected_or_conflicted", "considered_not_relied", "unreadable"] },
+        "reason_codes": { "type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true, "items": { "enum": ["primary_source", "directly_addresses_scope", "cross_verified", "contradicted_by_primary", "stale_or_changed", "citation_missing", "unreadable_or_paywalled", "irrelevant_to_scope", "unclear"] } },
+        "related_source_refs": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/source_ref" } },
+        "source_type": { "enum": ["primary", "regulator", "publisher", "community", "unknown"] },
+        "published_date_precision": { "enum": ["day", "month", "year", "unknown"] }
+      }
+    }
+  ]
+}

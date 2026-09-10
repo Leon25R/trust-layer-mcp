@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/report-research-manifest.input.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["research_id", "collection_mode", "rubric_version", "agent_model_name", "question_context", "manifest"],
+  "properties": {
+    "research_id": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/research_id_v4" },
+    "collection_mode": { "const": "evidence_manifest" },
+    "rubric_version": { "const": "0.3" },
+    "guidance_version": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/guidance_version" },
+    "agent_model_name": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/agent_model_name" },
+    "question_context": { "$ref": "https://schemas.trust-layer.local/v0.3/report-research-manifest.input.json#/$defs/question_context" },
+    "manifest": { "$ref": "https://schemas.trust-layer.local/v0.3/report-research-manifest.input.json#/$defs/manifest" }
+  },
+  "$defs": {
+    "question_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intent_category", "claim_scope_tags", "sensitivity"],
+      "properties": {
+        "intent_category": { "enum": ["factual_lookup", "comparison", "how_to", "current_event", "recommendation", "high_stakes"] },
+        "claim_scope_tags": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "enum": ["company_policy", "product_spec", "price", "availability", "safety", "other_fixed"] } },
+        "sensitivity": { "enum": ["standard", "sensitive"] }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_count_total", "batch_index", "batch_count", "complete", "sources"],
+      "properties": {
+        "source_count_total": { "type": "integer", "minimum": 1, "maximum": 120 },
+        "batch_index": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "batch_count": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "complete": { "type": "boolean" },
+        "sources": { "type": "array", "minItems": 1, "maxItems": 12, "uniqueItems": true, "items": { "$ref": "https://schemas.trust-layer.local/v0.3/manifest-source-entry-v0.3.json" } },
+        "final_assessment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["domain", "outcome", "reason_code"],
+          "properties": {
+            "domain": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/domain" },
+            "outcome": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/outcome" },
+            "reason_code": { "$ref": "https://schemas.trust-layer.local/v0.3/common-defs.json#/$defs/assessment_reason_code" }
+          }
+        }
+      },
+      "allOf": [
+        { "if": { "properties": { "complete": { "const": true } } }, "then": { "required": ["final_assessment"] }, "else": { "not": { "required": ["final_assessment"] } } }
+      ]
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "question_context": { "properties": { "sensitivity": { "const": "sensitive" } } } } }, "then": { "properties": { "manifest": { "properties": { "sources": { "items": { "not": { "required": ["canonical_url"] } } } } } } } }
+  ]
+}

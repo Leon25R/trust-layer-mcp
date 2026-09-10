@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "code",
+    "batch_outcome",
+    "processed_count",
+    "accepted_count",
+    "idempotent_count",
+    "rejected_count",
+    "remaining_24h",
+    "results"
+  ],
+  "properties": {
+    "ok": { "const": true },
+    "code": { "const": "batch_processed" },
+    "batch_outcome": { "enum": ["all_accepted", "partial_success", "all_rejected"] },
+    "processed_count": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "accepted_count": { "type": "integer", "minimum": 0, "maximum": 5 },
+    "idempotent_count": { "type": "integer", "minimum": 0, "maximum": 5 },
+    "rejected_count": { "type": "integer", "minimum": 0, "maximum": 5 },
+    "remaining_24h": { "type": "integer", "minimum": 0, "maximum": 50 },
+    "results": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items": {
+        "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/item_result"
+      }
+    }
+  },
+  "$defs": {
+    "item_result": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "item_index", "status", "receipt_id", "aggregate_effect",
+            "rate_charge", "remaining_24h_after_item"
+          ],
+          "properties": {
+            "item_index": { "type": "integer", "minimum": 0, "maximum": 4 },
+            "status": { "const": "accepted" },
+            "receipt_id": { "type": "string", "pattern": "^r_[A-Za-z0-9_-]{16,64}$" },
+            "aggregate_effect": { "enum": ["eligible", "pending_weight", "deduplicated"] },
+            "rate_charge": { "enum": ["new_token_domain", "none_already_contributed"] },
+            "remaining_24h_after_item": { "type": "integer", "minimum": 0, "maximum": 50 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "item_index", "status", "receipt_id", "aggregate_effect",
+            "rate_charge", "remaining_24h_after_item"
+          ],
+          "properties": {
+            "item_index": { "type": "integer", "minimum": 0, "maximum": 4 },
+            "status": { "const": "accepted_idempotent" },
+            "receipt_id": { "type": "string", "pattern": "^r_[A-Za-z0-9_-]{16,64}$" },
+            "aggregate_effect": { "enum": ["eligible", "deduplicated"] },
+            "rate_charge": { "const": "none_idempotent" },
+            "remaining_24h_after_item": { "type": "integer", "minimum": 0, "maximum": 50 }
+          }
+        },
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_invalid_schema" },
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_invalid_schema_cooldown" },
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_duplicate" },
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_duplicate_cooldown" },
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_id_conflict_or_expired" },
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_rate_limited" },
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_internal_error" }
+      ]
+    },
+    "rejected_base": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_index", "status", "error_code", "retry_directive"],
+      "properties": {
+        "item_index": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "status": { "const": "rejected" },
+        "error_code": {
+          "enum": [
+            "invalid_schema",
+            "duplicate_research_id_in_batch",
+            "research_id_conflict",
+            "batch_expired",
+            "rate_limited",
+            "internal_error"
+          ]
+        },
+        "retry_directive": {
+          "enum": [
+            "fix_input_then_retry",
+            "fix_input_then_retry_after_delay",
+            "remove_duplicate_then_retry",
+            "remove_duplicate_then_retry_after_delay",
+            "do_not_retry_same_research_id",
+            "retry_same_research_id_after_delay",
+            "retry_same_research_id"
+          ]
+        },
+        "retry_after_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+      }
+    },
+    "rejected_invalid_schema": {
+      "allOf": [
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_base" },
+        {
+          "properties": {
+            "error_code": { "const": "invalid_schema" },
+            "retry_directive": { "const": "fix_input_then_retry" }
+          },
+          "not": { "required": ["retry_after_seconds"] }
+        }
+      ]
+    },
+    "rejected_invalid_schema_cooldown": {
+      "allOf": [
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_base" },
+        {
+          "required": ["retry_after_seconds"],
+          "properties": {
+            "error_code": { "const": "invalid_schema" },
+            "retry_directive": { "const": "fix_input_then_retry_after_delay" }
+          }
+        }
+      ]
+    },
+    "rejected_duplicate": {
+      "allOf": [
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_base" },
+        {
+          "properties": {
+            "error_code": { "const": "duplicate_research_id_in_batch" },
+            "retry_directive": { "const": "remove_duplicate_then_retry" }
+          },
+          "not": { "required": ["retry_after_seconds"] }
+        }
+      ]
+    },
+    "rejected_duplicate_cooldown": {
+      "allOf": [
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_base" },
+        {
+          "required": ["retry_after_seconds"],
+          "properties": {
+            "error_code": { "const": "duplicate_research_id_in_batch" },
+            "retry_directive": { "const": "remove_duplicate_then_retry_after_delay" }
+          }
+        }
+      ]
+    },
+    "rejected_id_conflict_or_expired": {
+      "allOf": [
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_base" },
+        {
+          "properties": {
+            "error_code": { "enum": ["research_id_conflict", "batch_expired"] },
+            "retry_directive": { "const": "do_not_retry_same_research_id" }
+          },
+          "not": { "required": ["retry_after_seconds"] }
+        }
+      ]
+    },
+    "rejected_rate_limited": {
+      "allOf": [
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_base" },
+        {
+          "required": ["retry_after_seconds"],
+          "properties": {
+            "error_code": { "const": "rate_limited" },
+            "retry_directive": { "const": "retry_same_research_id_after_delay" }
+          }
+        }
+      ]
+    },
+    "rejected_internal_error": {
+      "allOf": [
+        { "$ref": "https://schemas.trust-layer.local/v0.3/report-domain-assessments-batch.success.json#/$defs/rejected_base" },
+        {
+          "properties": {
+            "error_code": { "const": "internal_error" },
+            "retry_directive": { "const": "retry_same_research_id" }
+          },
+          "not": { "required": ["retry_after_seconds"] }
+        }
+      ]
+    }
+  }
+}
