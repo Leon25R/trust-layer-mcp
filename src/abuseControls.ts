@@ -1,5 +1,7 @@
 const PUBLIC_LOOKUP_WINDOW_MS = 60_000;
 const PUBLIC_LOOKUP_LIMIT = 30;
+const PUBLIC_STATS_WINDOW_MS = 60_000;
+const PUBLIC_STATS_LIMIT = 30;
 const PUBLIC_CACHE_MISS_WINDOW_MS = 1_000;
 const PUBLIC_CACHE_MISS_LIMIT = 5;
 const FEEDBACK_DAY_MS = 86_400_000;
@@ -26,6 +28,7 @@ function retryAfter(oldest: number, windowMs: number, now: number): number {
 export class AbuseControls {
   private readonly admissionsBySource = new Map<string, number[]>();
   private readonly lookupsBySource = new Map<string, number[]>();
+  private readonly statsBySource = new Map<string, number[]>();
   private readonly feedbackBySource = new Map<string, { day: number; count: number }>();
   private cacheMisses: number[] = [];
   private globalAdmissions: number[] = [];
@@ -69,6 +72,15 @@ export class AbuseControls {
     this.cacheMisses.push(now);
   }
 
+  reservePublicStats(sourceKey: string, now = Date.now()): void {
+    this.sweep(now);
+    this.ensureCapacity(this.statsBySource, sourceKey);
+    const sourceTimestamps = this.statsBySource.get(sourceKey) ?? [];
+    if (sourceTimestamps.length >= PUBLIC_STATS_LIMIT) throw new AbuseLimitError(retryAfter(sourceTimestamps[0], PUBLIC_STATS_WINDOW_MS, now));
+    sourceTimestamps.push(now);
+    this.statsBySource.set(sourceKey, sourceTimestamps);
+  }
+
   reserveFeedback(sourceKey: string, now = Date.now()): void {
     this.sweep(now);
     this.ensureCapacity(this.feedbackBySource, sourceKey);
@@ -80,9 +92,9 @@ export class AbuseControls {
   }
 
   sweep(now = Date.now()): void {
-    for (const map of [this.admissionsBySource, this.lookupsBySource]) {
+    for (const [map, windowMs] of [[this.admissionsBySource, PUBLIC_LOOKUP_WINDOW_MS], [this.lookupsBySource, PUBLIC_LOOKUP_WINDOW_MS], [this.statsBySource, PUBLIC_STATS_WINDOW_MS]] as const) {
       for (const [key, timestamps] of map) {
-        const live = prune(timestamps, now, PUBLIC_LOOKUP_WINDOW_MS);
+        const live = prune(timestamps, now, windowMs);
         if (live.length) map.set(key, live); else map.delete(key);
       }
     }
@@ -96,4 +108,5 @@ export class AbuseControls {
   }
 }
 export const PUBLIC_LOOKUP_RATE_LIMIT = PUBLIC_LOOKUP_LIMIT;
+export const PUBLIC_STATS_RATE_LIMIT = PUBLIC_STATS_LIMIT;
 export const PUBLIC_FEEDBACK_RATE_LIMIT = FEEDBACK_LIMIT;

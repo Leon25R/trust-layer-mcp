@@ -4,12 +4,21 @@ import { parseAllowedOrigins, requireSecret } from "./config.js";
 import { createDatabaseFromEnvironment, PostgresCompatDatabase, type TrustLayerDatabase } from "./db.js";
 import {
   buildPublicProjections,
+  buildPublicStatsProjection,
   normalizePublicDomain,
   PublicLookupUnavailableError,
   PUBLIC_CONSENT_VERSION,
+  PUBLIC_STATS_COVERAGE_STARTED_AT,
+  PUBLIC_STATS_REFRESH_INTERVAL_MS,
+  sanitizePublicStatsProjection,
   type PublicProjection,
   type PublicProjectionBuildInput,
   type PublicProjectionPublication,
+  type PublicStatsObservation,
+  type PublicStatsProjection,
+  type PublicStatsProjectionBuildInput,
+  type PublicStatsPublication,
+  type PublicStatsProjectionPublisher,
   type PublicSignalNotice,
 } from "./publicLookup.js";
 import { SchemaCatalog, type ToolName } from "./schemaCatalog.js";
@@ -17,7 +26,7 @@ import type {
   Aggregate, AssessmentBatchInput, AssessmentInput, BatchAcceptedResult, BatchIdempotentResult,
   BatchItemResult, BatchRejectedResult, BatchSuccessResult, Clock, ErrorResult,
   Hold, InputUsage, LookupInput, ManifestInput, ModelFamily, ModelName, Participant, Receipt,
-  ResearchManifest, Rollup, SourceDecision, StoreState, SuccessResult, ToolContext, ToolResult,
+  PublicStatsLedger, ResearchManifest, Rollup, SourceDecision, StoreState, SuccessResult, ToolContext, ToolResult,
   Tombstone, VerificationInput,
 } from "./types.js";
 
@@ -61,6 +70,8 @@ export interface TrustLayerOptions {
   publicOperatorObservations?: ReadonlyMap<string, PublicSignalNotice>;
   /** A failed builder makes the public projection unavailable instead of empty. */
   publicProjectionBuilder?: (input: PublicProjectionBuildInput) => ReadonlyMap<string, PublicProjection>;
+  /** A failed stats builder makes the aggregate-only stats snapshot unavailable. */
+  publicStatsProjectionBuilder?: (input: PublicStatsProjectionBuildInput) => PublicStatsProjection;
 }
 
 export type PublicProjectionPublisher = (publication: PublicProjectionPublication) => void;
@@ -203,6 +214,7 @@ function stableStringify(value: unknown): string {
 
 function emptyState(): StoreState {
   return {
+    publicStatsLedger: { coverageStartedAt: PUBLIC_STATS_COVERAGE_STARTED_AT, acceptedByDate: {} },
     participants: {}, sites: {}, aggregates: {}, rollups: {}, receipts: {}, manifests: {},
     sourceDecisions: {}, tombstones: {}, verifications: {}, holds: {}, inputUsage: {},
     assessmentUsage: {}, modelFamilyMap: {
@@ -231,9 +243,13 @@ export class TrustLayerService {
   private tail: Promise<void> = Promise.resolve();
   private readonly publicOperatorObservations: ReadonlyMap<string, PublicSignalNotice>;
   private readonly publicProjectionBuilder?: TrustLayerOptions["publicProjectionBuilder"];
+  private readonly publicStatsProjectionBuilder?: TrustLayerOptions["publicStatsProjectionBuilder"];
   private publicProjectionPublisher: PublicProjectionPublisher | undefined;
+  private publicStatsProjectionPublisher: PublicStatsProjectionPublisher | undefined;
   private publicProjectionGenerationAttempted = false;
+  private publicStatsProjectionGenerationAttempted = false;
   private lastPublicProjections = new Map<string, PublicProjection>();
+  private lastStatsPublication: PublicStatsPublication | undefined;
   private lastDurableState: StoreState = emptyState();
   private persistenceFailed = false;
   private lastPublication: PublicProjectionPublication | undefined;
@@ -248,6 +264,7 @@ export class TrustLayerService {
     this.stage = options.stage ?? 2;
     this.publicOperatorObservations = new Map(options.publicOperatorObservations ?? []);
     this.publicProjectionBuilder = options.publicProjectionBuilder;
+    this.publicStatsProjectionBuilder = options.publicStatsProjectionBuilder;
     this.database = options.database ?? (process.env.DATABASE_URL || process.env.NODE_ENV === "production"
       ? createDatabaseFromEnvironment()
       : new PostgresCompatDatabase({ filePath: options.dbFile ?? null }));
@@ -386,9 +403,12 @@ export class TrustLayerService {
   async runRetention(): Promise<{ manifestsExpired: number; receiptsDeleted: number; rollupsDeleted: number; tombstonesDeleted: number }> {
     return this.exclusive(async () => {
       const draft = cloneState(this.state);
+      this.ensurePublicStatsLedger(draft);
       const result = this.runTtl(draft);
+      this.updatePublicStatsLedger(draft);
       this.state = draft;
       await this.persistAndPublish();
+      this.refreshPublicStatsProjection();
       return result;
     });
   }
@@ -443,6 +463,7 @@ export class TrustLayerService {
   async initialize(): Promise<void> {
     await this.exclusive(async () => {
       if (!this.publicProjectionGenerationAttempted) this.refreshPublicProjection();
+      if (!this.publicStatsProjectionGenerationAttempted) this.refreshPublicStatsProjection(true);
       this.scheduleMaintenance();
     });
   }
@@ -484,7 +505,24 @@ export class TrustLayerService {
       const draft = cloneState(this.state);
       draft.publicPrincipalBindings = { ...bindings, [participant.participantId]: principalId };
       draft.publicConsents ??= {};
-      draft.publicConsents[receiptId] = { receiptId, principalId, consentVersion: PUBLIC_CONSENT_VERSION, consentedAt: iso(nowMs(this.clock)), revokedAt: null };
+      const previousConsent = draft.publicConsents[receiptId];
+      const now = iso(nowMs(this.clock));
+      const coverageStart = Date.parse(`${PUBLIC_STATS_COVERAGE_STARTED_AT}T00:00:00Z`);
+      const observedAt = Date.parse(receipt.observedAt);
+      const previousConsentCovered = previousConsent?.statsEligible === true
+        && Date.parse(previousConsent.consentedAt) >= coverageStart && observedAt >= coverageStart;
+      const statsEligible = previousConsentCovered || (nowMs(this.clock) >= coverageStart && observedAt >= coverageStart);
+      draft.publicConsents[receiptId] = {
+        receiptId,
+        principalId,
+        consentVersion: PUBLIC_CONSENT_VERSION,
+        consentedAt: previousConsentCovered ? previousConsent!.consentedAt : now,
+        revokedAt: null,
+        statsEligible,
+        statsCounted: previousConsentCovered && previousConsent?.statsCounted === true,
+      };
+      this.ensurePublicStatsLedger(draft);
+      this.updatePublicStatsLedger(draft);
       this.state = draft;
       await this.persistAndPublish();
     });
@@ -533,9 +571,20 @@ export class TrustLayerService {
 
   private publishUnavailable(): void {
     this.publicProjectionGenerationAttempted = true;
+    this.publishPublicProjectionUnavailable();
+    this.publishPublicStatsUnavailable();
+  }
+
+  private publishPublicProjectionUnavailable(): void {
     this.lastPublication = { available: false, generatedAt: nowMs(this.clock), projections: new Map(), invalidatedDomains: [...this.lastPublicProjections.keys()] };
     this.lastPublicProjections.clear();
     this.publicProjectionPublisher?.(this.lastPublication);
+  }
+
+  private publishPublicStatsUnavailable(): void {
+    this.publicStatsProjectionGenerationAttempted = true;
+    this.lastStatsPublication = { available: false, generatedAt: nowMs(this.clock) };
+    this.publicStatsProjectionPublisher?.(this.lastStatsPublication);
   }
 
   /** Connects the writer's immutable projection publication to anonymous lookup. */
@@ -546,24 +595,127 @@ export class TrustLayerService {
     else publisher({ available: false, generatedAt: nowMs(this.clock), projections: new Map(), invalidatedDomains: [] });
   }
 
+  /** Connects the aggregate-only published stats snapshot to anonymous HTTP. */
+  attachPublicStatsProjectionPublisher(publisher: PublicStatsProjectionPublisher): void {
+    this.publicStatsProjectionPublisher = publisher;
+    if (this.lastStatsPublication) publisher(this.lastStatsPublication);
+    else publisher({ available: false, generatedAt: nowMs(this.clock) });
+  }
+
   private refreshPublicProjection(): void {
     if (this.persistenceFailed) { this.publishUnavailable(); return; }
     this.publicProjectionGenerationAttempted = true;
     const generatedAt = nowMs(this.clock);
     try {
-      const input: PublicProjectionBuildInput = {
+      const { input } = this.publicProjectionBuildInput(generatedAt);
+      const projections = new Map(this.publicProjectionBuilder?.(input) ?? buildPublicProjections(input));
+      const invalidatedDomains = this.changedPublicProjectionDomains(this.lastPublicProjections, projections);
+      this.lastPublicProjections = new Map(projections);
+      this.lastPublication = { available: true, generatedAt, projections, invalidatedDomains };
+      this.publicProjectionPublisher?.(this.lastPublication);
+    } catch {
+      this.publishUnavailable();
+    }
+  }
+
+  private ensurePublicStatsLedger(state: StoreState): PublicStatsLedger {
+    state.publicStatsLedger ??= { coverageStartedAt: PUBLIC_STATS_COVERAGE_STARTED_AT, acceptedByDate: {} };
+    return state.publicStatsLedger;
+  }
+
+  /** Count each newly eligible consent once, without putting identifiers in the ledger. */
+  private updatePublicStatsLedger(state: StoreState): void {
+    const ledger = this.ensurePublicStatsLedger(state);
+    const now = nowMs(this.clock);
+    const today = dateKey(now);
+    const coverageStart = Date.parse(`${ledger.coverageStartedAt}T00:00:00Z`);
+    if (!Number.isFinite(coverageStart) || ledger.coverageStartedAt !== PUBLIC_STATS_COVERAGE_STARTED_AT
+      || !ledger.acceptedByDate || typeof ledger.acceptedByDate !== "object") throw new Error("invalid public stats ledger");
+    for (const consent of Object.values(state.publicConsents ?? {})) {
+      if (consent.statsEligible !== true || consent.statsCounted === true || consent.revokedAt !== null) continue;
+      const receipt = state.receipts[consent.receiptId];
+      const participant = receipt && state.participants[receipt.tokenHash];
+      const observedAt = receipt ? Date.parse(receipt.observedAt) : Number.NaN;
+      const consentedAt = Date.parse(consent.consentedAt);
+      if (!receipt || receipt.publicEligible !== true || !participant || participant.stoppedAt
+        || consent.consentVersion !== PUBLIC_CONSENT_VERSION || state.publicPrincipalBindings?.[participant.participantId] !== consent.principalId
+        || !Number.isFinite(observedAt) || !Number.isFinite(consentedAt) || observedAt <= now - RECEIPT_TTL
+        || receipt.observedAt.slice(0, 10) >= today || consent.consentedAt.slice(0, 10) >= today
+        || observedAt < coverageStart || consentedAt < coverageStart) continue;
+      const date = consent.consentedAt.slice(0, 10);
+      const current = ledger.acceptedByDate[date] ?? 0;
+      if (!Number.isSafeInteger(current) || current < 0 || current >= Number.MAX_SAFE_INTEGER) throw new Error("invalid public stats ledger");
+      ledger.acceptedByDate[date] = current + 1;
+      consent.statsCounted = true;
+    }
+  }
+
+  private refreshPublicStatsProjection(force = false): void {
+    this.publicStatsProjectionGenerationAttempted = true;
+    if (this.persistenceFailed) { this.publishUnavailable(); return; }
+    const generatedAt = Math.floor(nowMs(this.clock) / PUBLIC_STATS_REFRESH_INTERVAL_MS) * PUBLIC_STATS_REFRESH_INTERVAL_MS;
+    if (!force && this.lastStatsPublication?.available && this.lastStatsPublication.generatedAt >= generatedAt) return;
+    if (!this.lastPublication?.available) { this.publishPublicStatsUnavailable(); return; }
+    try {
+      // Reading stats must not materialize a ledger in a legacy state. The
+      // ledger is created only by a writer such as consent or retention.
+      const ledger = this.state.publicStatsLedger ?? {
+        coverageStartedAt: PUBLIC_STATS_COVERAGE_STARTED_AT,
+        acceptedByDate: {},
+      };
+      const { statsObservations } = this.publicProjectionBuildInput(generatedAt);
+      const input: PublicStatsProjectionBuildInput = {
+        generatedAt,
+        coverageStartedAt: ledger.coverageStartedAt,
+        acceptedByDate: ledger.acceptedByDate,
+        observations: statsObservations,
+      };
+      const projection = sanitizePublicStatsProjection(this.publicStatsProjectionBuilder?.(input) ?? buildPublicStatsProjection(input));
+      this.lastStatsPublication = { available: true, generatedAt, projection };
+      this.publicStatsProjectionPublisher?.(this.lastStatsPublication);
+    } catch {
+      // Stats is an aggregate-only extension. A bad stats builder must not
+      // erase the already published domain-signal projection.
+      this.publishPublicStatsUnavailable();
+    }
+  }
+
+  private publicProjectionBuildInput(generatedAt: number): { input: PublicProjectionBuildInput; statsObservations: PublicStatsObservation[] } {
+    const statsObservations: PublicStatsObservation[] = [];
+    const observations = Object.values(this.state.publicConsents ?? {}).flatMap((consent) => {
+      const receipt = this.state.receipts[consent.receiptId];
+      const participant = receipt && this.state.participants[receipt.tokenHash];
+      const today = dateKey(generatedAt);
+      if (!receipt || receipt.publicEligible !== true || !participant || participant.stoppedAt
+        || consent.revokedAt !== null || consent.consentVersion !== PUBLIC_CONSENT_VERSION
+        || this.state.publicPrincipalBindings?.[participant.participantId] !== consent.principalId
+        || Date.parse(receipt.observedAt) <= generatedAt - RECEIPT_TTL
+        || !(receipt.observedAt.slice(0, 10) < today) || !(consent.consentedAt.slice(0, 10) < today)) return [];
+      // Legacy public consents may still serve the existing domain-signal
+      // projection, but they must never be backfilled into stats coverage.
+      if (consent.statsEligible === true) {
+        const coverageStart = Date.parse(`${PUBLIC_STATS_COVERAGE_STARTED_AT}T00:00:00Z`);
+        const observedAt = Date.parse(receipt.observedAt);
+        const consentedAt = Date.parse(consent.consentedAt);
+        if (Number.isFinite(coverageStart) && Number.isFinite(observedAt) && Number.isFinite(consentedAt)
+          && observedAt >= coverageStart && consentedAt >= coverageStart
+          && observedAt <= generatedAt && consentedAt <= generatedAt) {
+          statsObservations.push({ domain: receipt.domain, principalId: consent.principalId, provenanceGroupHash: receipt.provenanceGroupHash, consentedAt: consent.consentedAt, observedAt: receipt.observedAt });
+        }
+      }
+      return [{
+        domain: receipt.domain,
+        principalId: consent.principalId,
+        consentVersion: consent.consentVersion,
+        observedDate: receipt.observedAt.slice(0, 10),
+        provenanceGroupHash: receipt.provenanceGroupHash,
+        observedAt: receipt.observedAt,
+      }];
+    });
+    return {
+      input: {
         aggregates: this.state.aggregates,
-        observations: Object.values(this.state.publicConsents ?? {}).flatMap((consent) => {
-          const receipt = this.state.receipts[consent.receiptId];
-          const participant = receipt && this.state.participants[receipt.tokenHash];
-          const today = dateKey(generatedAt);
-          if (!receipt || receipt.publicEligible !== true || !participant || participant.stoppedAt
-            || consent.revokedAt !== null || consent.consentVersion !== PUBLIC_CONSENT_VERSION
-            || this.state.publicPrincipalBindings?.[participant.participantId] !== consent.principalId
-            || Date.parse(receipt.observedAt) <= generatedAt - RECEIPT_TTL
-            || !(receipt.observedAt.slice(0, 10) < today) || !(consent.consentedAt.slice(0, 10) < today)) return [];
-          return [{ domain: receipt.domain, principalId: consent.principalId, consentVersion: consent.consentVersion, observedDate: receipt.observedAt.slice(0, 10) }];
-        }),
+        observations,
         rollups: Object.values(this.state.rollups).map((rollup) => ({
           domain: rollup.domain,
           provenanceGroupHash: rollup.provenanceGroupHash,
@@ -577,15 +729,9 @@ export class TrustLayerService {
           active: hold.releasedAt === null && (hold.expiresAt === null || new Date(hold.expiresAt).getTime() > generatedAt),
         })),
         operatorObservations: this.publicOperatorObservations,
-      };
-      const projections = new Map(this.publicProjectionBuilder?.(input) ?? buildPublicProjections(input));
-      const invalidatedDomains = this.changedPublicProjectionDomains(this.lastPublicProjections, projections);
-      this.lastPublicProjections = new Map(projections);
-      this.lastPublication = { available: true, generatedAt, projections, invalidatedDomains };
-      this.publicProjectionPublisher?.(this.lastPublication);
-    } catch {
-      this.publishUnavailable();
-    }
+      },
+      statsObservations,
+    };
   }
 
   private changedPublicProjectionDomains(
@@ -608,6 +754,9 @@ export class TrustLayerService {
           this.lastDurableState = cloneState(this.state);
           const oldHolds = JSON.stringify(this.state.holds);
           this.normalizeHolds(this.state);
+          // Do not initialize or persist the stats ledger while merely loading
+          // state for an anonymous read. Legacy ledger migration belongs to a
+          // write boundary (consent/retention).
           if (JSON.stringify(this.state.holds) !== oldHolds) await this.persistAndPublish();
           this.initialized = true;
         } catch {

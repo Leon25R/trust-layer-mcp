@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { runInNewContext } from "node:vm";
-import { AbuseControls, PUBLIC_ADMISSION_LIMIT, PUBLIC_CONCURRENCY_LIMIT } from "../src/abuseControls.js";
-import { buildPublicProjections, PublicLookup, PUBLIC_CONSENT_VERSION } from "../src/publicLookup.js";
+import { AbuseControls, PUBLIC_ADMISSION_LIMIT, PUBLIC_CONCURRENCY_LIMIT, PUBLIC_STATS_RATE_LIMIT } from "../src/abuseControls.js";
+import { buildPublicProjections, buildPublicStatsProjection, PublicLookup, PUBLIC_CONSENT_VERSION } from "../src/publicLookup.js";
 import type { StoreState } from "../src/types.js";
 import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
@@ -14,7 +14,7 @@ import { MutableClock } from "../src/clock.js";
 import { PostgresCompatDatabase } from "../src/db.js";
 import { OAuthService } from "../src/oauth.js";
 import { createHttpServer } from "../src/server.js";
-import { normalizePublicDomain, lookupPublicDomain, PUBLIC_PROJECTION_MAX_AGE_MS } from "../src/publicLookup.js";
+import { normalizePublicDomain, lookupPublicDomain, PUBLIC_PROJECTION_MAX_AGE_MS, PUBLIC_STATS_COVERAGE_STARTED_AT, PUBLIC_STATS_PROJECTION_MAX_AGE_MS } from "../src/publicLookup.js";
 import { TrustLayerService } from "../src/service.js";
 
 class InProcessResponse extends EventEmitter {
@@ -47,11 +47,12 @@ async function requestInProcess(
   body?: unknown,
   remoteAddress = "198.51.100.10",
 ): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: unknown }> {
-  const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]) as unknown as IncomingMessage;
+  const bodyBuffer = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
+  const req = Readable.from(bodyBuffer === undefined ? [] : [bodyBuffer]) as unknown as IncomingMessage;
   Object.assign(req, {
     method,
     url,
-    headers: body === undefined ? {} : { "content-type": "application/json" },
+    headers: bodyBuffer === undefined ? {} : { "content-type": "application/json", "content-length": String(bodyBuffer.length) },
     socket: { remoteAddress },
   });
   const response = new InProcessResponse();
@@ -285,6 +286,236 @@ describe("登録不要の公開閲覧API", () => {
     expect(accepted.headers["access-control-allow-methods"]).toBe("POST, OPTIONS");
     const rejected = await requestInProcess(listener, "/api/public/feedback", "POST", { category: "helpful", comment: "do not store" });
     expect(rejected.status).toBe(400);
+  });
+});
+
+describe("公開統計API v1", () => {
+  it("exact countではなく固定帯域だけを返し、ドメイン・個別観測・内部診断を含めない", async () => {
+    const clock = new MutableClock("2026-09-15T00:00:00Z");
+    const service = new TrustLayerService({ dbFile: null, clock, secret: "public-stats-band-contract" });
+    const domain = "stats-private.example.com";
+    for (let index = 0; index < 12; index += 1) {
+      const token = await service.issueSyntheticToken(`stats-group-${index}`);
+      const result = await service.executeTool("report_domain_assessment", assessment(randomUUID(), domain), { token: token.token });
+      await service.recordPublicConsent(receiptIdFrom(result), randomUUID(), PUBLIC_CONSENT_VERSION);
+    }
+    clock.advanceMs(DAY);
+    await service.runRetention();
+    const response = await requestInProcess(publicServer(service).listeners("request")[0] as RequestListener, "/api/public/stats");
+    expect(response.status).toBe(200);
+    const body = responseObject(response.body);
+    expect(Object.keys(body).sort()).toEqual(["coverage_started_at", "generated_at", "limitations", "metrics", "recent_activity", "schema_version", "scope"]);
+    expect(body).toMatchObject({
+      schema_version: "public-stats-v1",
+      coverage_started_at: PUBLIC_STATS_COVERAGE_STARTED_AT,
+      scope: "active_publicly_consented_minimal_observations",
+      recent_activity: "activity_within_7d",
+    });
+    expect(body.metrics).toEqual({
+      accepted_observations: { kind: "cumulative_publicly_consented", display_range: "10-49" },
+      observed_domains: { kind: "currently_publicly_qualifying", display_range: "1-9" },
+      provenance_groups: { kind: "active_on_publicly_qualifying_domains", display_range: "10-49" },
+    });
+    expect(body).not.toHaveProperty("accepted_observations_count");
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain(domain);
+    for (const forbidden of ["support", "rejection", "insufficient", "decisive", "groupCount", "group_count", "principal", "participant", "receipt", "token", "research_id", "model_family", "provenanceGroupHash"]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+
+  it("query parameterを受け付けず、stats専用予約枠で31回目を429にする", async () => {
+    const service = new TrustLayerService({ dbFile: null, secret: "public-stats-admission" });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    const query = await requestInProcess(listener, "/api/public/stats?domain=secret.example.com");
+    expect(query.status).toBe(400);
+    expect(query.body).toEqual({ error: "invalid_request" });
+    expect(JSON.stringify(query.body)).not.toContain("secret.example.com");
+    const optionsWithQuery = await requestInProcess(listener, "/api/public/stats?domain=secret.example.com", "OPTIONS");
+    expect(optionsWithQuery.status).toBe(400);
+    expect(optionsWithQuery.body).toEqual({ error: "invalid_request" });
+    expect(optionsWithQuery.headers["access-control-allow-origin"]).toBe("*");
+    const responses = [];
+    for (let index = 0; index < PUBLIC_STATS_RATE_LIMIT + 1; index += 1) {
+      responses.push(await requestInProcess(listener, "/api/public/stats", "GET", undefined, "198.51.100.88"));
+    }
+    expect(responses.slice(0, PUBLIC_STATS_RATE_LIMIT).every((response) => response.status === 200)).toBe(true);
+    expect(responses[PUBLIC_STATS_RATE_LIMIT]).toMatchObject({ status: 429, body: { error: "rate_limited", retry_after_seconds: expect.any(Number) } });
+    expect(responses[PUBLIC_STATS_RATE_LIMIT].headers["retry-after"]).toBeDefined();
+  });
+
+  it("coverage開始前の同意・観測はstatsの現在値とrecent activityへ混入しない", async () => {
+    const clock = new MutableClock("2026-09-14T00:00:00Z");
+    const service = new TrustLayerService({ dbFile: null, clock, secret: "public-stats-coverage-boundary" });
+    for (let index = 0; index < 3; index += 1) {
+      const token = await service.issueSyntheticToken(`precoverage-group-${index}`);
+      const result = await service.executeTool("report_domain_assessment", assessment(randomUUID(), "precoverage.example.com"), { token: token.token });
+      await service.recordPublicConsent(receiptIdFrom(result), randomUUID(), PUBLIC_CONSENT_VERSION);
+    }
+    clock.set("2026-09-16T00:00:00Z");
+    await service.runRetention();
+    const body = responseObject((await requestInProcess(publicServer(service).listeners("request")[0] as RequestListener, "/api/public/stats")).body);
+    expect(body.metrics).toEqual({
+      accepted_observations: { kind: "cumulative_publicly_consented", display_range: "0" },
+      observed_domains: { kind: "currently_publicly_qualifying", display_range: "0" },
+      provenance_groups: { kind: "active_on_publicly_qualifying_domains", display_range: "0" },
+    });
+    expect(body.recent_activity).toBe("no_public_activity_yet");
+    const state = (service as unknown as { state: StoreState }).state;
+    expect(Object.values(state.publicConsents ?? {}).every((consent) => consent.statsEligible !== true)).toBe(true);
+  });
+
+  it("coverage前後混在時もstatsのdomain/group閾値はcoverage開始後だけで再計算する", async () => {
+    const clock = new MutableClock("2026-09-14T00:00:00Z");
+    const service = new TrustLayerService({ dbFile: null, clock, secret: "public-stats-mixed-coverage-boundary" });
+    const domain = "mixed-coverage.example.com";
+    for (let index = 0; index < 3; index += 1) {
+      const token = await service.issueSyntheticToken(`mixed-precoverage-group-${index}`);
+      const result = await service.executeTool("report_domain_assessment", assessment(randomUUID(), domain), { token: token.token });
+      await service.recordPublicConsent(receiptIdFrom(result), randomUUID(), PUBLIC_CONSENT_VERSION);
+    }
+
+    clock.set("2026-09-15T00:00:00Z");
+    const postCoverageToken = await service.issueSyntheticToken("mixed-postcoverage-group");
+    const postCoverageResult = await service.executeTool("report_domain_assessment", assessment(randomUUID(), domain), { token: postCoverageToken.token });
+    await service.recordPublicConsent(receiptIdFrom(postCoverageResult), randomUUID(), PUBLIC_CONSENT_VERSION);
+
+    clock.set("2026-09-16T00:00:00Z");
+    await service.runRetention();
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    expect(responseObject((await requestInProcess(listener, `/api/public/domain-signal?domain=${domain}`)).body).publication_status).toBe("limited_observations");
+    const body = responseObject((await requestInProcess(listener, "/api/public/stats")).body);
+    expect(body.metrics).toEqual({
+      accepted_observations: { kind: "cumulative_publicly_consented", display_range: "1-9" },
+      observed_domains: { kind: "currently_publicly_qualifying", display_range: "0" },
+      provenance_groups: { kind: "active_on_publicly_qualifying_domains", display_range: "0" },
+    });
+    expect(body.recent_activity).toBe("activity_within_7d");
+  });
+
+  it("recent_activityは公開基準未達の同意済み観測も対象にする", async () => {
+    const clock = new MutableClock("2026-09-15T00:00:00Z");
+    const service = new TrustLayerService({ dbFile: null, clock, secret: "public-stats-recent-independent" });
+    const token = await service.issueSyntheticToken("thin-stats-group");
+    const result = await service.executeTool("report_domain_assessment", assessment(randomUUID(), "thin-stats.example.com"), { token: token.token });
+    await service.recordPublicConsent(receiptIdFrom(result), randomUUID(), PUBLIC_CONSENT_VERSION);
+    clock.advanceMs(DAY);
+    await service.runRetention();
+    const body = responseObject((await requestInProcess(publicServer(service).listeners("request")[0] as RequestListener, "/api/public/stats")).body);
+    expect(body.metrics).toMatchObject({
+      accepted_observations: { display_range: "1-9" },
+      observed_domains: { display_range: "0" },
+      provenance_groups: { display_range: "0" },
+    });
+    expect(body.recent_activity).toBe("activity_within_7d");
+  });
+
+  it("legacy stateの匿名stats GETはledgerを初期化・永続化しない", async () => {
+    const template = new TrustLayerService({ dbFile: null, secret: "public-stats-legacy-template" });
+    const legacy = structuredClone((template as unknown as { state: StoreState }).state);
+    delete legacy.publicStatsLedger;
+    const database = new PostgresCompatDatabase();
+    vi.spyOn(database, "loadState").mockReturnValue(legacy);
+    const save = vi.spyOn(database, "saveState");
+    const service = new TrustLayerService({ database, secret: "public-stats-read-only-init" });
+    const response = await requestInProcess(publicServer(service).listeners("request")[0] as RequestListener, "/api/public/stats");
+    expect(response.status).toBe(200);
+    expect(save).not.toHaveBeenCalled();
+    expect((service as unknown as { state: StoreState }).state.publicStatsLedger).toBeUndefined();
+  });
+
+  it("stats builder失敗はdomain-signalの公開projectionを消去しない", async () => {
+    const service = new TrustLayerService({
+      dbFile: null,
+      secret: "public-stats-failure-isolation",
+      publicStatsProjectionBuilder: () => { throw new Error("stats builder failure"); },
+    });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    const domain = await requestInProcess(listener, "/api/public/domain-signal?domain=stable.example.org");
+    expect(domain.status).toBe(200);
+    expect(responseObject(domain.body).publication_status).toBe("no_public_observations");
+    const stats = await requestInProcess(listener, "/api/public/stats");
+    expect(stats.status).toBe(503);
+    expect(stats.body).toEqual({ error: "service_unavailable" });
+  });
+
+  it("全体admissionの429にも公開CORSを付与する", async () => {
+    vi.useFakeTimers();
+    const service = new TrustLayerService({ dbFile: null, secret: "public-global-admission-cors" });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    for (let index = 0; index < 300; index += 1) {
+      const response = await requestInProcess(listener, "/api/public/stats", "GET", undefined, `198.51.${Math.floor(index / 256)}.${index % 256}`);
+      expect(response.status).toBe(200);
+    }
+    const limited = await requestInProcess(listener, "/api/public/stats", "GET", undefined, "198.51.2.45");
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({ error: "rate_limited", retry_after_seconds: expect.any(Number) });
+    expect(limited.headers["access-control-allow-origin"]).toBe("*");
+  });
+
+  it("OPTIONS/405/成功/制限を含めno-storeと非credential CORSを維持する", async () => {
+    const service = new TrustLayerService({ dbFile: null, secret: "public-stats-http-contract" });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    const samples = [
+      await requestInProcess(listener, "/api/public/stats"),
+      await requestInProcess(listener, "/api/public/stats", "OPTIONS"),
+      await requestInProcess(listener, "/api/public/stats", "DELETE"),
+    ];
+    expect(samples.map((sample) => sample.status)).toEqual([200, 204, 405]);
+    for (const sample of samples) {
+      expect(sample.headers["cache-control"]).toBe("no-store");
+      expect(sample.headers["access-control-allow-origin"]).toBe("*");
+      expect(sample.headers["access-control-allow-credentials"]).toBeUndefined();
+    }
+  });
+
+  it("unexpected bodyの413でもno-storeと非credential CORSを維持する", async () => {
+    const service = new TrustLayerService({ dbFile: null, secret: "public-stats-body-contract" });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    const response = await requestInProcess(listener, "/api/public/stats", "GET", { ignored: true });
+    expect(response.status).toBe(413);
+    expect(response.body).toEqual({ error: "invalid_request" });
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(response.headers["access-control-allow-origin"]).toBe("*");
+    expect(response.headers["access-control-allow-credentials"]).toBeUndefined();
+  });
+
+  it("projectionの生成失敗・鮮度超過はゼロ件へフォールバックせず503にする", async () => {
+    const failing = new TrustLayerService({
+      dbFile: null,
+      secret: "public-stats-builder-failure",
+      publicStatsProjectionBuilder: () => { throw new Error("stats builder failure"); },
+    });
+    const failed = await requestInProcess(publicServer(failing).listeners("request")[0] as RequestListener, "/api/public/stats");
+    expect(failed.status).toBe(503);
+    expect(failed.body).toEqual({ error: "service_unavailable" });
+
+    const clock = new MutableClock("2026-09-15T00:00:00Z");
+    const service = new TrustLayerService({ dbFile: null, clock, secret: "public-stats-stale" });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    expect((await requestInProcess(listener, "/api/public/stats")).status).toBe(200);
+    clock.advanceMs(PUBLIC_STATS_PROJECTION_MAX_AGE_MS + 1);
+    const stale = await requestInProcess(listener, "/api/public/stats");
+    expect(stale.status).toBe(503);
+    expect(stale.body).toEqual({ error: "service_unavailable" });
+  });
+
+  it("stats projectionは書込みごとに即時再生成せず、60秒境界でだけ再生成する", async () => {
+    const clock = new MutableClock("2026-09-16T00:00:00Z");
+    const builder = vi.fn(buildPublicStatsProjection);
+    const service = new TrustLayerService({ dbFile: null, clock, secret: "public-stats-fixed-cycle", publicStatsProjectionBuilder: builder });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    expect((await requestInProcess(listener, "/api/public/stats")).status).toBe(200);
+    expect(builder).toHaveBeenCalledTimes(1);
+    const token = await service.issueSyntheticToken("fixed-cycle-group");
+    const result = await service.executeTool("report_domain_assessment", assessment(randomUUID(), "fixed-cycle.example.com"), { token: token.token });
+    await service.recordPublicConsent(receiptIdFrom(result), randomUUID(), PUBLIC_CONSENT_VERSION);
+    expect(builder).toHaveBeenCalledTimes(1);
+    await service.runRetention();
+    expect(builder).toHaveBeenCalledTimes(1);
+    clock.advanceMs(60_000);
+    await service.runRetention();
+    expect(builder).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -9,6 +9,19 @@ export const PUBLIC_NEXT_CHECKS = ["identify_publisher", "check_date", "check_pr
 export const PUBLIC_LIMITATIONS = ["not_a_truth_rating"] as const;
 export const PUBLIC_PROJECTION_MAX_AGE_MS = 60_000;
 
+export const PUBLIC_STATS_SCHEMA_VERSION = "public-stats-v1" as const;
+export const PUBLIC_STATS_COVERAGE_STARTED_AT = "2026-09-15" as const;
+export const PUBLIC_STATS_REFRESH_INTERVAL_MS = 60_000;
+export const PUBLIC_STATS_PROJECTION_MAX_AGE_MS = 120_000;
+export const PUBLIC_STATS_LIMITATIONS = [
+  "aggregated_only",
+  "no_domain_enumeration",
+  "not_a_truth_rating",
+  "groups_do_not_prove_independence",
+] as const;
+export const PUBLIC_STATS_COUNT_BANDS = ["0", "1-9", "10-49", "50-99", "100+"] as const;
+export type PublicStatsCountBand = (typeof PUBLIC_STATS_COUNT_BANDS)[number];
+
 export const PUBLICATION_STATUSES = [
   "no_public_observations",
   "limited_observations",
@@ -79,12 +92,65 @@ export interface PublicProjectionBuildInput {
     principalId: string;
     consentVersion: typeof PUBLIC_CONSENT_VERSION;
     observedDate: string;
+    /** Internal-only fields used by the separate stats builder. */
+    provenanceGroupHash?: string;
+    observedAt?: string;
   }[];
   aggregates: Readonly<Record<string, PublicProjectionAggregateInput>>;
   rollups: readonly PublicProjectionRollupInput[];
   holds: readonly PublicProjectionHoldInput[];
   operatorObservations?: ReadonlyMap<string, PublicSignalNotice>;
 }
+
+export interface PublicStatsObservation {
+  /** Internal-only. Never copied into a public stats response. */
+  domain: string;
+  /** Internal-only. Used only to recompute the post-coverage threshold. */
+  principalId: string;
+  /** Internal-only. Never copied into a public stats response. */
+  provenanceGroupHash: string;
+  /** Internal-only. Never copied into a public stats response. */
+  consentedAt: string;
+  observedAt: string;
+}
+
+export interface PublicStatsProjectionBuildInput {
+  generatedAt: number;
+  coverageStartedAt: string;
+  acceptedByDate: Readonly<Record<string, number>>;
+  observations: readonly PublicStatsObservation[];
+}
+
+export interface PublicStatsProjection {
+  schema_version: typeof PUBLIC_STATS_SCHEMA_VERSION;
+  generated_at: string;
+  coverage_started_at: string;
+  scope: "active_publicly_consented_minimal_observations";
+  metrics: {
+    accepted_observations: {
+      kind: "cumulative_publicly_consented";
+      display_range: PublicStatsCountBand;
+    };
+    observed_domains: {
+      kind: "currently_publicly_qualifying";
+      display_range: PublicStatsCountBand;
+    };
+    provenance_groups: {
+      kind: "active_on_publicly_qualifying_domains";
+      display_range: PublicStatsCountBand;
+    };
+  };
+  recent_activity: "no_public_activity_yet" | "activity_within_7d" | "no_activity_within_7d";
+  limitations: [...typeof PUBLIC_STATS_LIMITATIONS];
+}
+
+export interface PublicStatsPublication {
+  available: boolean;
+  generatedAt: number;
+  projection?: PublicStatsProjection;
+}
+
+export type PublicStatsProjectionPublisher = (publication: PublicStatsPublication) => void;
 
 export interface PublicProjectionPublication {
   available: boolean;
@@ -232,6 +298,165 @@ export function buildPublicProjections(input: PublicProjectionBuildInput): Map<s
   return projections;
 }
 
+function isPublicStatsCountBand(value: unknown): value is PublicStatsCountBand {
+  return typeof value === "string" && (PUBLIC_STATS_COUNT_BANDS as readonly string[]).includes(value);
+}
+
+function isFiniteInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function sumPublicStatsLedger(acceptedByDate: Readonly<Record<string, number>>, coverageStartedAt: string): number {
+  const coverageStart = Date.parse(`${coverageStartedAt}T00:00:00Z`);
+  if (!Number.isFinite(coverageStart)) throw new PublicLookupUnavailableError();
+  let total = 0;
+  for (const [date, count] of Object.entries(acceptedByDate)) {
+    const dateMs = Date.parse(`${date}T00:00:00Z`);
+    if (!validDate(date) || dateMs < coverageStart || !isFiniteInteger(count) || !Number.isSafeInteger(total + count)) {
+      throw new PublicLookupUnavailableError();
+    }
+    total += count;
+  }
+  return total;
+}
+
+function clonePublicStatsProjection(projection: PublicStatsProjection): PublicStatsProjection {
+  return {
+    schema_version: projection.schema_version,
+    generated_at: projection.generated_at,
+    coverage_started_at: projection.coverage_started_at,
+    scope: projection.scope,
+    metrics: {
+      accepted_observations: { ...projection.metrics.accepted_observations },
+      observed_domains: { ...projection.metrics.observed_domains },
+      provenance_groups: { ...projection.metrics.provenance_groups },
+    },
+    recent_activity: projection.recent_activity,
+    limitations: [...projection.limitations],
+  };
+}
+
+/** Convert internal stats inputs into the fixed, aggregate-only public contract. */
+export function buildPublicStatsProjection(input: PublicStatsProjectionBuildInput): PublicStatsProjection {
+  if (!Number.isSafeInteger(input.generatedAt) || input.generatedAt < 0
+    || input.coverageStartedAt !== PUBLIC_STATS_COVERAGE_STARTED_AT || !validDate(input.coverageStartedAt)) {
+    throw new PublicLookupUnavailableError();
+  }
+  const coverageStart = Date.parse(`${input.coverageStartedAt}T00:00:00Z`);
+  const acceptedCount = sumPublicStatsLedger(input.acceptedByDate, input.coverageStartedAt);
+  const principalsByDomain = new Map<string, Set<string>>();
+  const provenanceGroupsByDomain = new Map<string, Set<string>>();
+  let latestObservedAt: number | null = null;
+  const cutoff = input.generatedAt - 7 * 86_400_000;
+
+  for (const observation of input.observations) {
+    if (typeof observation.domain !== "string" || observation.domain.length === 0
+      || typeof observation.principalId !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(observation.principalId)
+      || typeof observation.provenanceGroupHash !== "string" || observation.provenanceGroupHash.length === 0) {
+      throw new PublicLookupUnavailableError();
+    }
+    const observedAt = Date.parse(observation.observedAt);
+    const consentedAt = Date.parse(observation.consentedAt);
+    if (!Number.isFinite(observedAt) || !Number.isFinite(consentedAt)
+      || observedAt > input.generatedAt || consentedAt > input.generatedAt) throw new PublicLookupUnavailableError();
+    // Coverage is an inclusion boundary for every stats metric. In
+    // particular, a legacy consent must not influence current domains,
+    // groups, or recent activity merely because it is still retained.
+    if (observedAt < coverageStart || consentedAt < coverageStart) continue;
+    const principals = principalsByDomain.get(observation.domain) ?? new Set<string>();
+    principals.add(observation.principalId.toLowerCase());
+    principalsByDomain.set(observation.domain, principals);
+    const groups = provenanceGroupsByDomain.get(observation.domain) ?? new Set<string>();
+    groups.add(observation.provenanceGroupHash);
+    provenanceGroupsByDomain.set(observation.domain, groups);
+    // Activity is intentionally independent of the three-principal domain
+    // publication threshold. A consented observation on a thin domain still
+    // demonstrates that public activity occurred.
+    if (latestObservedAt === null || observedAt > latestObservedAt) latestObservedAt = observedAt;
+  }
+
+  // Recompute the public threshold from the coverage-scoped observations.
+  // The domain-signal projection intentionally covers a wider lifetime and
+  // must not let pre-coverage principals qualify a current stats domain.
+  const qualifyingDomains = new Set<string>([...
+    principalsByDomain.entries(),
+  ].filter(([, principals]) => principals.size >= 3).map(([domain]) => domain));
+  const provenanceGroups = new Set<string>();
+  for (const domain of qualifyingDomains) {
+    for (const group of provenanceGroupsByDomain.get(domain) ?? []) provenanceGroups.add(group);
+  }
+
+  const recentActivity = acceptedCount === 0
+    ? "no_public_activity_yet"
+    : latestObservedAt !== null && latestObservedAt >= cutoff
+      ? "activity_within_7d"
+      : "no_activity_within_7d";
+  return {
+    schema_version: PUBLIC_STATS_SCHEMA_VERSION,
+    generated_at: new Date(input.generatedAt).toISOString(),
+    coverage_started_at: input.coverageStartedAt,
+    scope: "active_publicly_consented_minimal_observations",
+    metrics: {
+      accepted_observations: { kind: "cumulative_publicly_consented", display_range: countBand(acceptedCount) },
+      observed_domains: { kind: "currently_publicly_qualifying", display_range: countBand(qualifyingDomains.size) },
+      provenance_groups: { kind: "active_on_publicly_qualifying_domains", display_range: countBand(provenanceGroups.size) },
+    },
+    recent_activity: recentActivity,
+    limitations: [...PUBLIC_STATS_LIMITATIONS],
+  };
+}
+
+export function countBand(value: number): PublicStatsCountBand {
+  if (!isFiniteInteger(value)) throw new PublicLookupUnavailableError();
+  if (value === 0) return "0";
+  if (value < 10) return "1-9";
+  if (value < 50) return "10-49";
+  if (value < 100) return "50-99";
+  return "100+";
+}
+
+/**
+ * Re-encode a stats projection into the fixed public shape. This is also the
+ * final boundary for custom/internal builders: unknown fields are discarded.
+ */
+export function sanitizePublicStatsProjection(value: unknown): PublicStatsProjection {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new PublicLookupUnavailableError();
+  const record = value as Record<string, unknown>;
+  const metrics = record.metrics;
+  if (record.schema_version !== PUBLIC_STATS_SCHEMA_VERSION || typeof record.generated_at !== "string"
+    || !validDate(record.coverage_started_at) || record.scope !== "active_publicly_consented_minimal_observations"
+    || (record.recent_activity !== "no_public_activity_yet" && record.recent_activity !== "activity_within_7d" && record.recent_activity !== "no_activity_within_7d")
+    || !Array.isArray(record.limitations) || record.limitations.length !== PUBLIC_STATS_LIMITATIONS.length
+    || record.limitations.some((item, index) => item !== PUBLIC_STATS_LIMITATIONS[index])
+    || typeof metrics !== "object" || metrics === null || Array.isArray(metrics)) {
+    throw new PublicLookupUnavailableError();
+  }
+  const metricRecord = metrics as Record<string, unknown>;
+  const readMetric = (key: string, kind: string): { kind: string; display_range: PublicStatsCountBand } => {
+    const metric = metricRecord[key];
+    if (typeof metric !== "object" || metric === null || Array.isArray(metric)) throw new PublicLookupUnavailableError();
+    const candidate = metric as Record<string, unknown>;
+    if (candidate.kind !== kind || !isPublicStatsCountBand(candidate.display_range)) throw new PublicLookupUnavailableError();
+    return { kind, display_range: candidate.display_range };
+  };
+  const generatedAt = Date.parse(record.generated_at);
+  if (!Number.isFinite(generatedAt) || new Date(generatedAt).toISOString() !== record.generated_at) throw new PublicLookupUnavailableError();
+  return {
+    schema_version: PUBLIC_STATS_SCHEMA_VERSION,
+    generated_at: record.generated_at,
+    coverage_started_at: record.coverage_started_at as string,
+    scope: "active_publicly_consented_minimal_observations",
+    metrics: {
+      accepted_observations: readMetric("accepted_observations", "cumulative_publicly_consented") as PublicStatsProjection["metrics"]["accepted_observations"],
+      observed_domains: readMetric("observed_domains", "currently_publicly_qualifying") as PublicStatsProjection["metrics"]["observed_domains"],
+      provenance_groups: readMetric("provenance_groups", "active_on_publicly_qualifying_domains") as PublicStatsProjection["metrics"]["provenance_groups"],
+    },
+    recent_activity: record.recent_activity,
+    limitations: [...PUBLIC_STATS_LIMITATIONS],
+  };
+}
+
 function buildResponse(domain: string, route: SourceRoute | undefined, projection: PublicProjection | undefined): PublicDomainSignal {
   const status = projection?.publication_status ?? "no_public_observations";
   const signal = status === "no_public_observations" || status === "limited_observations"
@@ -360,6 +585,60 @@ export class PublicLookup {
       return false;
     }
     return true;
+  }
+}
+
+export class PublicStatsLookup {
+  private projection: PublicStatsProjection | undefined;
+  private projectionAvailable = false;
+  private projectionGeneratedAt: number | null = null;
+
+  constructor(
+    projectionMaxAgeMs = PUBLIC_STATS_PROJECTION_MAX_AGE_MS,
+    private readonly nowProvider: () => number = Date.now,
+  ) {
+    if (!Number.isInteger(projectionMaxAgeMs) || projectionMaxAgeMs < 1) throw new Error("invalid stats projection age");
+    this.projectionMaxAgeMs = projectionMaxAgeMs;
+  }
+
+  private readonly projectionMaxAgeMs: number;
+
+  applyProjectionPublication(publication: PublicStatsPublication): void {
+    if (!publication.available || !publication.projection) {
+      this.markProjectionUnavailable();
+      return;
+    }
+    const projection = sanitizePublicStatsProjection(publication.projection);
+    if (!Number.isSafeInteger(publication.generatedAt) || publication.generatedAt < 0 || publication.generatedAt !== Date.parse(projection.generated_at)) {
+      this.markProjectionUnavailable();
+      return;
+    }
+    this.projection = projection;
+    this.projectionAvailable = true;
+    this.projectionGeneratedAt = publication.generatedAt;
+  }
+
+  replaceProjection(projection: PublicStatsProjection, generatedAt = this.nowProvider()): void {
+    this.applyProjectionPublication({ available: true, generatedAt, projection });
+  }
+
+  markProjectionUnavailable(): void {
+    this.projection = undefined;
+    this.projectionAvailable = false;
+    this.projectionGeneratedAt = null;
+  }
+
+  lookup(now = this.nowProvider()): PublicStatsProjection {
+    if (!this.projectionAvailable || this.projection === undefined || this.projectionGeneratedAt === null
+      || now - this.projectionGeneratedAt > this.projectionMaxAgeMs) {
+      this.markProjectionUnavailable();
+      throw new PublicLookupUnavailableError();
+    }
+    return clonePublicStatsProjection(this.projection);
+  }
+
+  isFresh(now = this.nowProvider()): boolean {
+    try { this.lookup(now); return true; } catch { return false; }
   }
 }
 

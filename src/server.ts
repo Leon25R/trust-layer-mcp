@@ -17,6 +17,7 @@ import {
   PublicDomainValidationError,
   PublicLookup,
   PublicLookupUnavailableError,
+  PublicStatsLookup,
   validateSourceRoutes,
 } from "./publicLookup.js";
 
@@ -256,6 +257,8 @@ export function createHttpServer(service: TrustLayerService, oauth: OAuthService
     publicLookup = lookup;
     service.attachPublicProjectionPublisher((publication) => lookup.applyProjectionPublication(publication));
   } catch { publicLookup = undefined; }
+  const publicStatsLookup = new PublicStatsLookup(120_000, () => service.clock.now().getTime());
+  service.attachPublicStatsProjectionPublisher((publication) => publicStatsLookup.applyProjectionPublication(publication));
   const abuseControls = new AbuseControls();
   const sweepTimer = setInterval(() => { abuseControls.sweep(); publicLookup?.sweep(); }, 20_000);
   sweepTimer.unref();
@@ -264,13 +267,20 @@ export function createHttpServer(service: TrustLayerService, oauth: OAuthService
     // Set before parsing/admission so dynamic failures cannot be cached.
     res.setHeader("cache-control", "no-store");
     try {
+      const requestUrl = new URL(req.url ?? "/", "http://localhost");
+      const path = requestUrl.pathname;
+      // The global admission gate can reject before route handling. Establish
+      // the public response contract first so its 429 also carries CORS.
+      if (path.startsWith("/api/public/")) setPublicCors(res);
       const release = abuseControls.admit(requestSourceKey(req));
       res.once("finish", release);
       res.once("close", release);
       req.once("aborted", release);
-      const requestUrl = new URL(req.url ?? "/", "http://localhost");
-      const path = requestUrl.pathname;
       if (path.startsWith("/api/public/")) {
+        // Apply the public CORS policy before rejecting an unexpected body so
+        // body-limit failures have the same cross-origin contract as other
+        // public responses.
+        setPublicCors(res);
         // Do not keep sockets carrying unread/rejected bodies alive.
         res.shouldKeepAlive = false;
         res.once("finish", () => { if (req.complete === false) req.destroy(); });
@@ -306,6 +316,18 @@ export function createHttpServer(service: TrustLayerService, oauth: OAuthService
         const cacheHit = publicLookup.isCached(domain);
         abuseControls.reservePublicLookup(requestSourceKey(req), cacheHit);
         sendJson(res, 200, publicLookup.lookup(domain));
+        return;
+      }
+      if (path === "/api/public/stats") {
+        setPublicCors(res);
+        // OPTIONS is queryless as well; reject a query before the method
+        // branch so preflight cannot be used to probe an unsupported shape.
+        if (requestUrl.search) { sendJson(res, 400, { error: "invalid_request" }); return; }
+        if (req.method === "OPTIONS") { res.statusCode = 204; res.end(); return; }
+        if (req.method !== "GET") { res.statusCode = 405; res.setHeader("allow", "GET, OPTIONS"); res.end(); return; }
+        abuseControls.reservePublicStats(requestSourceKey(req));
+        await service.initialize();
+        sendJson(res, 200, publicStatsLookup.lookup());
         return;
       }
       if (path === "/api/public/feedback") {

@@ -287,3 +287,66 @@ GoogleDrive復旧後、以下を実施し、**事業オーナー自身のClaude�
 4. 本番DBマイグレーション・デプロイ・git commit/pushは未実施(事業オーナーの明示的な承認待ち)
 
 反復: 1回目レビュー(blocking7/advisory2) → Astra Medium修正 → 実機検証(81テスト) → 2回目レビュー(ok:true)。2反復で収束。
+
+## 2026-09-16 公開統計可視化 API v1（Luna）
+
+- 設計書 `事業計画/trust_layer_public_stats_design_20260915.md` に従い、`GET /api/public/stats` と `OPTIONS /api/public/stats` を追加した。応答は `public-stats-v1` の固定 schema とし、公開対象累計受理観測・現在の公開基準充足ドメイン・有効な出所グループを `0`／`1-9`／`10-49`／`50-99`／`100+` の帯域だけで返す。ドメイン、group hash、principal、participant、receipt、token、研究ID、個別時刻、支持率・S/R・内部 aggregate は応答へコピーしない。
+- `src/publicLookup.ts` に `PublicStatsLookup`、stats projection builder、固定形状の sanitizer、帯域変換を追加した。stats は既存の domain-signal projection と分離し、HTTP handler はメモリ上の published snapshot のみを読む。builder／publication／鮮度検証が失敗した場合は `503 service_unavailable` とし、`no_public_observations` やゼロ件へフォールバックしない。
+- `src/service.ts` に、日別件数だけを保持する `publicStatsLedger` と一度だけ数える consent marker を追加した。新実装後の明示同意だけを対象にし、観測日・同意日がUTC当日を過ぎるまで累計へ反映しない。既存の保存成功後の writer 境界を通し、stats は60秒境界でのみ再生成する。公開 projection の既存適格性判定と同じ active consent／participant／receipt／principal binding／TTL 条件を共有し、永続化・既存 projection・stats のいずれかが失敗した場合は全公開 snapshot を unavailable にする。
+- `src/abuseControls.ts` に送信元あたり30 req/minの stats 専用予約枠を追加した。全体 admission、送信元 admission、同時実行枠は既存の順序・上限を共有する。`src/server.ts` では公開CORS、`Cache-Control: no-store`、405／OPTIONS、query parameter拒否、stats専用予約枠を適用し、DB直読・MCP/OAuth経路の変更は行っていない。
+- `tests/publicAccess.test.ts` に帯域表示・内部情報非露出、query拒否、stats admission、CORS／no-store、projection生成失敗／鮮度超過503の回帰を追加した。既存の domain-signal／MCP／OAuth テストを含む全suiteが通過した。
+
+### 隔離検証
+
+- Google Drive同期フォルダでは `.bin` が欠落するため、実体コピー先を `/tmp/trust-layer-public-stats-final.g5xL2N/repo` とした。
+- 通常の `npm install --include=dev` は依存取得後の `esbuild` postinstall が sandbox の `spawnSync .../esbuild EPERM` で失敗した。失敗ログは `npm-install.log` に保存し、同じコピー先で `npm install --include=dev --ignore-scripts --offline --no-audit --no-fund` を成功させた。
+- `npm run build`: 成功（終了コード0、`npm-build.log`）。`npm test`: **6 test files / 86 tests PASS、終了コード0**（`npm-test-full.log`）。
+- 本番DBへのマイグレーション適用、本番デプロイ、git commit/pushは実施していない。
+
+### codex-review ゲート
+
+- large相当（7ファイル、変更約588行）として arch 相当レビューと標準の uncommitted レビューを read-only `codex review` で試行した。いずれもレビュー開始前に Codex CLI の in-process app-server 初期化が `Read-only file system (os error 30)` で失敗し、レビュー本体の結果は得られなかった。`codex exec` による自己再帰呼び出しは行っていない。
+- そのため blocking/advisory の件数、`ok:true`、収束済みとは判定していない。手動の差分・公開境界・既存テスト回帰照合は実施済みだが、Codexレビューゲートは未実施扱いである。レビュー実行可能な環境で `arch → diff → cross-check` を再実行すること。
+
+### 最終隔離コピー・レビュー再試行の追補
+
+- 最終コードを `/tmp/trust-layer-public-stats-final2.Edayj2/repo` へ再コピーし、`npm install --include=dev` → esbuild postinstallのsandbox `EPERM`、続けて `npm install --include=dev --ignore-scripts --offline --no-audit --no-fund` → 成功、`npm run build` → 成功、`npm test` → **6 test files / 86 tests PASS** を確認した。ログは同コピー先の `npm-install.log`、`npm-install-ignore-scripts.log`、`npm-build.log`、`npm-test-full.log` に保存した。
+- 最終状態に対する `codex review --uncommitted` も再試行したが、レビュー本体開始前の `Read-only file system (os error 30)` で終了した。ログは `/tmp/trust-layer-public-stats-review-final.log`。したがってレビューゲートは引き続き未実施扱いであり、`ok:true` は主張しない。
+
+### CORS補強後の最終検証
+
+- 公開パス入口でbody拒否より先に非credential CORSを設定し、GETのunexpected bodyに対する413回帰テストを追加した。
+- 最終コピー `/tmp/trust-layer-public-stats-final4.PvLvvs/repo` で `npm install --include=dev` はesbuild postinstallのsandbox `EPERM`（exit 1）となったため、`--ignore-scripts --offline --no-audit --no-fund`で依存を準備した。その後 `npm run build` 成功、`npm test` **6 test files / 87 tests PASS**（exit 0）を確認した。
+- この最終状態に対する `codex review --uncommitted` の再試行も、レビュー本体開始前に `Read-only file system (os error 30)` で終了した（`/tmp/trust-layer-public-stats-review-final2.log`）。Codexレビューの `ok:true` 収束は確認できないため、完了扱いにはしていない。
+- 最終差分は対象7ファイル、約600行の追加と32行の削除であり、large相当のレビュー規模は変わらない。
+
+## 2026-09-16 Terra blocking 5件・advisory 1件対応（Luna）
+
+- Blocking 1: stats observationへ観測時刻・同意時刻を保持し、`PUBLIC_STATS_COVERAGE_STARTED_AT` より前の値を accepted/domain/group/recent の全統計から除外した。ledgerの日付にもcoverage境界を適用し、旧同意を再同意しても旧観測をbackfillしない。
+- Blocking 2: `recent_activity` の最新観測時刻を公開基準（3 principal以上）で絞らず、公開同意済みでcoverage・保持期間・日次遅延を満たす観測全体から算出する。薄いdomainでも活動有りを示す。
+- Blocking 3: 匿名 `initialize()` とstats projection生成ではledgerをmaterializeしない。ledgerの生成・更新は公開同意やretentionなど書込み系操作に限定し、legacy stateの匿名GETはDB保存なしで安全なゼロ帯域を返す。
+- Blocking 4: stats builderの失敗境界をstats publisherだけに分離した。statsが503/unavailableでも、既に成功公開済みの `/api/public/domain-signal` projectionは消去しない。永続化失敗・domain-signal builder失敗など全体障害時のfail-closeは従来どおり維持する。
+- Blocking 5: request URL/pathを全体admission前に確定し、公開pathには先に非credential CORSを付ける。全体300 req/s admissionの429にも `Access-Control-Allow-Origin: *` が付く。
+- Advisory: `OPTIONS /api/public/stats` でもquery parameterを検査し、query付きpreflightを400で拒否する。
+- 各blocking項目に対応する回帰テストを `tests/publicAccess.test.ts` に追加した（coverage混入、薄いdomainのrecent activity、legacy ledger無書込み、stats/domain-signal失敗分離、全体429 CORS）。既存MCP/OAuth/domain-signal回帰も同時に確認した。
+
+### 隔離フル検証
+
+- 実行コピー: `/tmp/trust-layer-public-stats-fix.NV1EZY/repo`
+- 通常の `npm install --include=dev` はesbuild postinstallのsandbox `spawnSync .../esbuild EPERM` で失敗した（`/tmp/trust-layer-public-stats-fix.NV1EZY/npm-install.log`）。
+- 代替の `npm install --include=dev --ignore-scripts --offline --no-audit --no-fund` は成功（`npm-install-ignore-scripts.log`）。
+- `npm run build` は終了コード0（`npm-build.log`）。`npm test` は **6 test files / 92 tests PASS、終了コード0**（`npm-test-full.log`）。
+- 本番DBへのマイグレーション適用、本番デプロイ、git commit/pushは実施していない。codex-reviewの自己再帰呼び出しも実施していない。
+
+## 2026-09-16 Terra残存blocking 1件対応（Luna）
+
+- `PublicStatsObservation` に内部限定の `principalId` を追加し、`buildPublicStatsProjection` が coverage 開始後の stats observation だけから domain ごとの distinct principal 集合を再構築するよう修正した。3 principal 以上の domain だけを `observed_domains` として数え、その domain 上の group だけを `provenance_groups` に集計する。coverage 前後のデータを合算した既存 `domain-signal` projection は stats の閾値判定に使用しない。
+- `PublicStatsProjectionBuildInput` から `publicProjections` を除去し、stats builder が全期間ベースの `limited_observations` 等を再利用できない入力契約にした。`recent_activity` は従来どおり coverage 後の有効な observation 全体から独立して判定する。
+- `tests/publicAccess.test.ts` に、coverage 開始前に3 principalで閾値を満たした domainへ coverage 開始後に1 principalだけ追加する混在ケースを追加した。domain-signalは `limited_observations` のままでも、stats の `observed_domains`／`provenance_groups` は `0`、accepted observationは `1-9`、recent activityは有りになることを確認する。
+
+### 隔離フル検証
+
+- 実行コピー: `/tmp/trust-layer-remaining-blocking.Y8AZ53/repo`
+- 通常の `npm install` は依存取得後の `esbuild` postinstall が `/tmp` 内バイナリ実行制限（`spawnSync ... EPERM`）で失敗した（`/tmp/trust-layer-remaining-blocking.Y8AZ53/npm-install.log`）。同じコピーで `npm install --ignore-scripts --offline --no-audit --no-fund` は成功した（`npm-install-ignore-scripts.log`）。
+- `npm run build`: 成功、終了コード0（`/tmp/trust-layer-remaining-blocking.Y8AZ53/npm-build.log`）。`npm test`: **6 test files / 93 tests PASS、終了コード0**（`/tmp/trust-layer-remaining-blocking.Y8AZ53/npm-test-full.log`）。
+- 本番DBへのマイグレーション適用、本番デプロイ、git commit/push、`codex-review`の自己再帰呼び出しは実施していない。

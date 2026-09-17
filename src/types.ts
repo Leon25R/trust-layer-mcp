@@ -183,6 +183,15 @@ export interface PublicObservationConsent {
   consentVersion: "public-observation-v1";
   consentedAt: string;
   revokedAt: string | null;
+  /** Set only for consents created after the public-stats coverage start. */
+  statsEligible?: boolean;
+  /** Internal idempotency marker; the ledger itself remains non-identifying. */
+  statsCounted?: boolean;
+}
+
+export interface PublicStatsLedger {
+  coverageStartedAt: string;
+  acceptedByDate: Record<string, number>;
 }
 
 export interface Receipt {
@@ -267,6 +276,8 @@ export interface StoreState {
   publicConsents?: Record<string, PublicObservationConsent>;
   /** Verified operator-managed identity bindings, never inferred from groups. */
   publicPrincipalBindings?: Record<string, string>;
+  /** Daily aggregate only; never store domain, principal, receipt, or group IDs here. */
+  publicStatsLedger?: PublicStatsLedger;
   participants: Record<string, Participant>;
   sites: Record<string, { domain: string; firstObservedAt: string }>;
   aggregates: Record<string, Aggregate>;
