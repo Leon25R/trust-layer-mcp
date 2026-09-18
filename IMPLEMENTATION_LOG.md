@@ -350,3 +350,19 @@ GoogleDrive復旧後、以下を実施し、**事業オーナー自身のClaude�
 - 通常の `npm install` は依存取得後の `esbuild` postinstall が `/tmp` 内バイナリ実行制限（`spawnSync ... EPERM`）で失敗した（`/tmp/trust-layer-remaining-blocking.Y8AZ53/npm-install.log`）。同じコピーで `npm install --ignore-scripts --offline --no-audit --no-fund` は成功した（`npm-install-ignore-scripts.log`）。
 - `npm run build`: 成功、終了コード0（`/tmp/trust-layer-remaining-blocking.Y8AZ53/npm-build.log`）。`npm test`: **6 test files / 93 tests PASS、終了コード0**（`/tmp/trust-layer-remaining-blocking.Y8AZ53/npm-test-full.log`）。
 - 本番DBへのマイグレーション適用、本番デプロイ、git commit/push、`codex-review`の自己再帰呼び出しは実施していない。
+
+## 2026-09-17 公開統計ページ追加（Luna）
+
+- `public/stats.html` と `public/stats.js` を新規追加し、既存の匿名 `GET /api/public/stats` を人間向けの日本語画面として表示する。受理観測数・ドメイン数・出所グループ数はAPIの帯域を「0件」「1〜9件」等へ表示するだけで、具体的な件数へ変換しない。
+- `recent_activity` の3状態を日本語化し、集計対象開始日・最終更新時刻・limitationsを表示する。APIが503、通信失敗、契約不正のいずれでも統計領域を表示せず、「現在、統計を一時的に取得できません」と表示するため、ゼロや古い値へフォールバックしない。
+- `src/server.ts` に`loadPublicStatsHtml`と`GET /stats`、`/public/stats.js`の静的配信を追加した。既存ページと同じCSP（`script-src 'self'`）を設定し、`/stats`は認証・DB書込みなしでHTMLだけを返す。`public/index.html`との相互リンクも追加した。
+- `tests/publicAccess.test.ts` に`/stats`の匿名・読み取り専用配信、CSP・外部script、帯域表示、503時の非表示／非捏造を確認するテストを追加した。
+- 本番DBへのマイグレーション適用、本番デプロイ、git commit/pushは実施していない。
+
+### 隔離フル検証
+
+- 実行コピー: `/tmp/trust-layer-stats-ui-final.7PK7QC/repo`
+- 通常の`npm install --include=dev --no-audit --no-fund`は、依存取得後のesbuild postinstallがsandboxの実行制約（`spawnSync .../esbuild EPERM`）で失敗した。同じコピーで`npm install --include=dev --ignore-scripts --offline --no-audit --no-fund`を実行して依存を準備した。
+- `npm run build`: 成功（終了コード0）。ログ: `/tmp/trust-layer-stats-ui-final.7PK7QC/npm-build.log`
+- `npm test -- --pool=threads --maxWorkers=1 --no-file-parallelism`: **6 test files / 95 tests PASS、終了コード0**。ログ: `/tmp/trust-layer-stats-ui-final.7PK7QC/npm-test-full.log`
+- 通常の`npm install`の失敗ログ: `/tmp/trust-layer-stats-ui-final.7PK7QC/npm-install.log`。代替依存準備ログ: `/tmp/trust-layer-stats-ui-final.7PK7QC/npm-install-ignore-scripts.log`

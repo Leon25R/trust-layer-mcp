@@ -9,3 +9,4 @@ node_modules/
 # The original workspace excluded HTML files; the public entrypoint is source.
 *.html
 !public/index.html
+!public/stats.html

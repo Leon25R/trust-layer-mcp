@@ -147,6 +147,11 @@ function loadPublicHtml(moduleDir: string): string | null {
   return path ? readFileSync(path, "utf8") : null;
 }
 
+function loadPublicStatsHtml(moduleDir: string): string | null {
+  const path = projectRootCandidates(moduleDir, join("public", "stats.html")).find((candidate) => existsSync(candidate));
+  return path ? readFileSync(path, "utf8") : null;
+}
+
 function loadSourceRoutes(moduleDir: string): ReturnType<typeof validateSourceRoutes> {
   const path = projectRootCandidates(moduleDir, join("data", "source-routes.json")).find((candidate) => existsSync(candidate));
   if (!path) throw new PublicLookupUnavailableError();
@@ -251,6 +256,9 @@ export function createHttpServer(service: TrustLayerService, oauth: OAuthService
   const publicHtml = loadPublicHtml(moduleDir);
   const scriptPath = projectRootCandidates(moduleDir, join("public", "app.js")).find((candidate) => existsSync(candidate));
   const publicScript = scriptPath ? readFileSync(scriptPath, "utf8") : null;
+  const publicStatsHtml = loadPublicStatsHtml(moduleDir);
+  const statsScriptPath = projectRootCandidates(moduleDir, join("public", "stats.js")).find((candidate) => existsSync(candidate));
+  const publicStatsScript = statsScriptPath ? readFileSync(statsScriptPath, "utf8") : null;
   let publicLookup: PublicLookup | undefined;
   try {
     const lookup = new PublicLookup(loadSourceRoutes(moduleDir), new Map(), 60_000, 60_000, () => service.clock.now().getTime());
@@ -294,6 +302,12 @@ export function createHttpServer(service: TrustLayerService, oauth: OAuthService
         res.end(publicScript);
         return;
       }
+      if (path === "/public/stats.js" && req.method === "GET") {
+        if (publicStatsScript === null) { sendJson(res, 503, { error: "service_unavailable" }); return; }
+        res.setHeader("content-type", "text/javascript; charset=utf-8");
+        res.end(publicStatsScript);
+        return;
+      }
       if (path === "/healthz" && req.method === "GET") { sendJson(res, 200, { status: "ok" }); return; }
       if ((path === "/" || path === "/index.html" || path === "/public/index.html") && req.method === "GET") {
         if (publicHtml === null) { sendJson(res, 503, { error: "service_unavailable" }); return; }
@@ -302,6 +316,15 @@ export function createHttpServer(service: TrustLayerService, oauth: OAuthService
         res.setHeader("cache-control", "no-store");
         res.setHeader("content-security-policy", "default-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'unsafe-inline'");
         res.end(publicHtml);
+        return;
+      }
+      if (path === "/stats" && req.method === "GET") {
+        if (publicStatsHtml === null) { sendJson(res, 503, { error: "service_unavailable" }); return; }
+        res.statusCode = 200;
+        res.setHeader("content-type", "text/html; charset=utf-8");
+        res.setHeader("cache-control", "no-store");
+        res.setHeader("content-security-policy", "default-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'unsafe-inline'");
+        res.end(publicStatsHtml);
         return;
       }
       if (path === "/api/public/domain-signal") {

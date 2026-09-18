@@ -281,11 +281,87 @@ describe("登録不要の公開閲覧API", () => {
     expect(page.status).toBe(200);
     expect(page.headers["content-type"]).toContain("text/html");
     expect(page.body).toContain("Trust Layer 公開閲覧");
+    expect(page.body).toContain('href="/stats"');
     const accepted = await requestInProcess(listener, "/api/public/feedback", "POST", { category: "helpful", domain: "example.org" });
     expect(accepted.status).toBe(202);
     expect(accepted.headers["access-control-allow-methods"]).toBe("POST, OPTIONS");
     const rejected = await requestInProcess(listener, "/api/public/feedback", "POST", { category: "helpful", comment: "do not store" });
     expect(rejected.status).toBe(400);
+  });
+
+  it("/statsを認証なし・DB書込みなしで配信し、統計ページと戻りリンクを持つ", async () => {
+    const database = new PostgresCompatDatabase();
+    const saveState = vi.spyOn(database, "saveState");
+    const service = new TrustLayerService({ database, secret: "public-stats-page" });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    const page = await requestInProcess(listener, "/stats");
+    expect(page.status).toBe(200);
+    expect(page.headers["content-type"]).toContain("text/html");
+    expect(page.headers["content-security-policy"]).toContain("script-src 'self'");
+    expect(page.headers["content-security-policy"]).not.toContain("script-src 'unsafe-inline'");
+    expect(page.body).toContain("Trust Layer 公開統計");
+    expect(page.body).toContain('href="/"');
+    expect(page.body).toContain('src="/public/stats.js"');
+    expect(saveState).not.toHaveBeenCalled();
+    const script = await requestInProcess(listener, "/public/stats.js");
+    expect(script.status).toBe(200);
+    expect(script.headers["content-type"]).toContain("text/javascript");
+    expect(saveState).not.toHaveBeenCalled();
+  });
+
+  it("統計ページは帯域をそのまま日本語表示し、503時はゼロや古い値を表示しない", async () => {
+    const service = new TrustLayerService({ dbFile: null, secret: "public-stats-page-client" });
+    const listener = publicServer(service).listeners("request")[0] as RequestListener;
+    const script = await requestInProcess(listener, "/public/stats.js");
+    type StatsNode = { hidden: boolean; textContent: string; className: string; children: unknown[]; replaceChildren: () => void; appendChild: (child: unknown) => void };
+    const createDocument = () => {
+      const nodes = new Map<string, StatsNode>();
+      const node = (id: string): StatsNode => {
+        const existing = nodes.get(id);
+        if (existing) return existing;
+        const created: StatsNode = {
+          hidden: id === "stats-content",
+          textContent: id === "accepted-observations" || id === "observed-domains" || id === "provenance-groups" ? "—" : "",
+          className: "status",
+          children: [],
+          replaceChildren() { this.children = []; },
+          appendChild(child: unknown) { this.children.push(child); },
+        };
+        nodes.set(id, created);
+        return created;
+      };
+      return { nodes, document: { getElementById: node, createElement: () => node(`li-${nodes.size}`) } };
+    };
+    const successDom = createDocument();
+    const response = {
+      ok: true,
+      json: async () => ({
+        metrics: {
+          accepted_observations: { display_range: "1-9" },
+          observed_domains: { display_range: "10-49" },
+          provenance_groups: { display_range: "100+" },
+        },
+        recent_activity: "activity_within_7d",
+        coverage_started_at: "2026-09-15",
+        generated_at: "2026-09-16T00:00:00.000Z",
+        limitations: ["not_a_truth_rating"],
+      }),
+    };
+    const fetch = vi.fn().mockResolvedValue(response);
+    runInNewContext(String(script.body), { document: successDom.document, fetch, Date });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(successDom.nodes.get("accepted-observations")?.textContent).toBe("1〜9件");
+    expect(successDom.nodes.get("observed-domains")?.textContent).toBe("10〜49件");
+    expect(successDom.nodes.get("provenance-groups")?.textContent).toBe("100件以上");
+    expect(successDom.nodes.get("stats-content")?.hidden).toBe(false);
+
+    const unavailableDom = createDocument();
+    const unavailableFetch = vi.fn().mockResolvedValue({ ok: false, status: 503, json: async () => ({ error: "service_unavailable" }) });
+    runInNewContext(String(script.body), { document: unavailableDom.document, fetch: unavailableFetch, Date });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(unavailableDom.nodes.get("stats-content")?.hidden).toBe(true);
+    expect(unavailableDom.nodes.get("accepted-observations")?.textContent).toBe("—");
+    expect(unavailableDom.nodes.get("stats-status")?.textContent).toContain("統計を一時的に取得できません");
   });
 });
 
