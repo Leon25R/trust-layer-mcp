@@ -10,3 +10,4 @@ node_modules/
 *.html
 !public/index.html
 !public/stats.html
+!public/stats.html
